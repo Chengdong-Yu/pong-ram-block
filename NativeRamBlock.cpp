@@ -38,9 +38,8 @@ int native_ufs_store_read(uint64_t, uint32_t, void *) __attribute__((weak_import
 int native_ufs_store_write(uint64_t, uint32_t, const void *) __attribute__((weak_import));
 int native_ufs_store_sync(void) __attribute__((weak_import));
 unsigned native_ufs_store_gpt_check(void) __attribute__((weak_import));
-// Diagnostics. state: 0 off, 1 blank (read-only probe), 2 resumed, 3 fresh (Install and boot), 4 refused/failed, 5 degraded after an I/O
-// error, 6 resumed read-only (probe), 7 kept: the store holds no Data of this seed and no reset was asked, so it is left untouched and
-// this boot's Data runs from the seed alone (header: why). header: persist::checkHeader result.
+// Diagnostics. state: 0 off, 1 blank (read-only probe), 2 resumed, 3 fresh, 4 refused/failed, 5 degraded after an I/O error,
+// 6 resumed read-only (probe). header: persist::checkHeader result.
 volatile uint32_t native_data_persist_state = 0, native_data_persist_header = 9, native_data_persist_gpt = 0xff, native_data_persist_gpt_after = 0xff;
 volatile uint64_t native_data_persist_pages = 0, native_data_persist_loaded = 0, native_data_persist_writes = 0,
                   native_data_persist_syncs = 0, native_data_persist_errors = 0, native_data_persist_first_lba = 0,
@@ -76,15 +75,14 @@ public:
   // Called once, before the Data volume is mounted (native_ram_block_volume_seed): open the store window, put the pages that
   // earlier boots changed back into the sparse disk, and from then on write changed pages through. The seed identity
   // (seedHash) is not affected. Any refusal or error leaves the disk volatile, exactly as without persistence.
-  // sheng-data-reset=1 or 2 (the boot menu's Install and boot) starts the overlay over (the old pages are dropped, not applied); 2 also
-  // asks for Setup (BootWatchdogPolicy.c). It is the only way the store is made anew: a store of another seed, a blank or a damaged one
-  // is kept as it is on any other boot.
+  // sheng-data-reset=1 or 2 starts the overlay over (the old pages are dropped, not applied); 2 also asks for Setup (BootWatchdogPolicy.c).
   static bool discardRequested() { uint32_t v = 0; return PE_parse_boot_argn("sheng-data-reset", &v, sizeof v) && (v == 1 || v == 2); }
   void attachStore() {
     if (!gate) return;
     IOLockLock(gate);
     if (storeAttached) { IOLockUnlock(gate); return; }
     storeAttached = true;
+#if !defined(PONG_RAM_BLOCK_VOLATILE_ONLY) || !PONG_RAM_BLOCK_VOLATILE_ONLY
     unsigned mode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
     if (mode && (sparse.pages || isBig) && &native_ufs_store_open && &native_ufs_store_read && &native_ufs_store_write &&
         &native_ufs_store_sync && &native_ufs_store_gpt_check) {
@@ -109,11 +107,6 @@ public:
           overlay.active = false;
         } else if (result == persist::Open::Blank) {
           native_data_persist_state = 1;
-        } else if (result == persist::Open::Kept) {
-          native_data_persist_state = 7;
-          overlay.active = false;
-          IOLog("NativeRamBlock: the persistent store holds no Data of this seed (header %d); kept, Data runs from the seed: "
-                "use Install and boot to start it over\n", overlay.header);
         } else if (result == persist::Open::Fresh) {
           native_data_persist_state = 3;
           direct = mode == 2;
@@ -151,6 +144,7 @@ public:
         native_data_persist_gpt_after = native_ufs_store_gpt_check();
       }
     }
+#endif
     IOLockUnlock(gate);
   }
 
@@ -193,12 +187,23 @@ OSDefineMetaClassAndStructors(NativeRamBlock, IOBlockStorageDevice)
 
 bool NativeRamBlock::start(IOService *provider)
 {
-  if (!IOBlockStorageDevice::start(provider)) return false;
+  IOLog("NativeRamBlock: start entered provider=%s\n",
+        provider ? provider->getName() : "?");
+  if (!IOBlockStorageDevice::start(provider)) {
+    IOLog("NativeRamBlock: IOBlockStorageDevice start failed\n");
+    return false;
+  }
   IORegistryEntry *map = IORegistryEntry::fromPath("/chosen/memory-map", gIODTPlane);
-  if (!map) return false;
+  if (!map) {
+    IOLog("NativeRamBlock: /chosen/memory-map unavailable\n");
+    return false;
+  }
   OSData *packed = OSDynamicCast(OSData, map->getProperty("PackedRAMDisk"));
   OSData *range = OSDynamicCast(OSData, map->getProperty("RAMDisk"));
-  if(packed && range){map->release();return false;}
+  if(packed && range){
+    IOLog("NativeRamBlock: conflicting RAMDisk and PackedRAMDisk ranges\n");
+    map->release();return false;
+  }
   if(packed)range=packed;
   bool packedInput=packed!=nullptr;
   uint64_t physical = 0, bytes = 0;
@@ -209,12 +214,23 @@ bool NativeRamBlock::start(IOService *provider)
   map->release();
   // Boot memory belongs to the loader/kernel; never allocate or free it here.
   if (!bytes || bytes > 0x80000000 || (physical & 4095) || (!packedInput && (bytes & 4095)) ||
-      physical < gPhysBase || bytes > gPhysSize || physical - gPhysBase > gPhysSize - bytes) return false;
+      physical < gPhysBase || bytes > gPhysSize || physical - gPhysBase > gPhysSize - bytes) {
+    IOLog("NativeRamBlock: invalid %s range base=%llx bytes=%llx phys=%llx+%llx\n",
+          packedInput ? "PackedRAMDisk" : "RAMDisk", physical, bytes,
+          (unsigned long long)gPhysBase, (unsigned long long)gPhysSize);
+    return false;
+  }
   memory = reinterpret_cast<uint8_t *>(ml_static_ptovirt(physical));
-  if (!memory || !(gate = IOLockAlloc())) return false;
+  if (!memory || !(gate = IOLockAlloc())) {
+    IOLog("NativeRamBlock: boot memory mapping/lock failed base=%llx\n", physical);
+    return false;
+  }
   uint64_t logical=bytes;
   if(packedInput){
-    if(!ramPackedLayout(memory,bytes,&logical))return false;
+    if(!ramPackedLayout(memory,bytes,&logical)){
+      IOLog("NativeRamBlock: invalid DBRDISK1 packed layout source-bytes=%llx\n", bytes);
+      return false;
+    }
     struct ImportOps {uint8_t *allocate(){return static_cast<uint8_t *>(IOMallocZero(4096));}} ops;
     if(logical>0x80000000ULL){
       uint64_t nonzero=0;
@@ -222,29 +238,49 @@ bool NativeRamBlock::start(IOService *provider)
       big.bytes=logical;big.capacity=nonzero;
       big.index=static_cast<uint64_t *>(IOMallocZero((nonzero?nonzero:1)*sizeof(uint64_t)));
       big.page=static_cast<uint8_t **>(IOMallocZero((nonzero?nonzero:1)*sizeof(uint8_t *)));
-      if(!big.index||!big.page||!seedImportSparse(big,memory,bytes,ops))return false;
+      if(!big.index||!big.page||!seedImportSparse(big,memory,bytes,ops)){
+        IOLog("NativeRamBlock: sparse large seed import failed logical-bytes=%llx\n", logical);
+        return false;
+      }
       isBig=true;sparse.bytes=logical;
     }else{
       sparse.bytes=logical;
       sparse.pages=static_cast<uint8_t **>(IOMallocZero((logical/4096)*sizeof(uint8_t *)));
-      if(!ramSparseImport(sparse,memory,bytes,ops))return false;
+      if(!ramSparseImport(sparse,memory,bytes,ops)){
+        IOLog("NativeRamBlock: sparse seed import failed logical-bytes=%llx\n", logical);
+        return false;
+      }
     }
   }
   capacity = logical / 512;
-  SHA256_CTX context;
-  SHA256_Init(&context);
-  if(isBig){
-    seedIdentity(big,context,[](SHA256_CTX &c){SHA256_Init(&c);},[](SHA256_CTX &c,const void *p,size_t n){SHA256_Update(&c,p,n);},
-                 [](SHA256_CTX &c,uint8_t *out){SHA256_Final(out,&c);},seedHash);
-    memory=nullptr;
-  }else{
-  if(sparse.pages){
-    static const uint8_t zero[4096]={};
-    for(uint64_t i=0;i<logical/4096;++i)SHA256_Update(&context,sparse.pages[i]?sparse.pages[i]:zero,4096);
-    memory=nullptr;
-  }else SHA256_Update(&context, memory, bytes);
-  SHA256_Final(seedHash, &context);
+#if defined(PONG_RAM_BLOCK_VOLATILE_ONLY) && PONG_RAM_BLOCK_VOLATILE_ONLY
+  // Pong's scratch Data is RAM-only; no persistence overlay consumes a seed digest.
+  memset(seedHash, 0, sizeof(seedHash));
+  if (sparse.pages || isBig) memory = nullptr;
+#else
+  // Pong's volatile scratch Data has no persistent overlay. Its seed digest
+  // is only an overlay identity, not an APFS or boot authorization check.
+  unsigned storeMode = &native_ufs_store_mode ? native_ufs_store_mode() : 0;
+  if (storeMode) {
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    if(isBig){
+      seedIdentity(big,context,[](SHA256_CTX &c){SHA256_Init(&c);},[](SHA256_CTX &c,const void *p,size_t n){SHA256_Update(&c,p,n);},
+                   [](SHA256_CTX &c,uint8_t *out){SHA256_Final(out,&c);},seedHash);
+      memory=nullptr;
+    }else{
+    if(sparse.pages){
+      static const uint8_t zero[4096]={};
+      for(uint64_t i=0;i<logical/4096;++i)SHA256_Update(&context,sparse.pages[i]?sparse.pages[i]:zero,4096);
+      memory=nullptr;
+    }else SHA256_Update(&context, memory, bytes);
+    SHA256_Final(seedHash, &context);
+    }
+  } else {
+    memset(seedHash, 0, sizeof(seedHash));
+    if (sparse.pages || isBig) memory = nullptr;
   }
+#endif
   memcpy(native_ram_block_seed_sha256,seedHash,32);
   native_ram_block_bytes = logical;
   native_ram_block_sparse=(sparse.pages||isBig)?1:0;
@@ -252,6 +288,15 @@ bool NativeRamBlock::start(IOService *provider)
   online = true;
   native_ram_block_ready = 1;
   registerService();
+  IOLog("NativeRamBlock: published %s bytes=%llu sparse=%u resident=%llu seed-sha256=%s\n",
+        packedInput ? "PackedRAMDisk" : "RAMDisk", logical,
+        native_ram_block_sparse, native_ram_block_resident_bytes,
+#if defined(PONG_RAM_BLOCK_VOLATILE_ONLY) && PONG_RAM_BLOCK_VOLATILE_ONLY
+        "skipped (volatile only)"
+#else
+        "compiled per nonvolatile build"
+#endif
+  );
   return true;
 }
 
@@ -300,6 +345,9 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
       uint64_t copy(uint64_t at,const void *p,uint64_t n){return buffer->writeBytes(at,p,n);}
     } ops={buffer};
     bool write=buffer->getDirection()==kIODirectionOut;
+#if defined(PONG_RAM_BLOCK_VOLATILE_ONLY) && PONG_RAM_BLOCK_VOLATILE_ONLY
+    actual=ramSparseIO(sparse,write,block*512,bytes,ops,noMemory);
+#else
     if(direct){
       struct BufferOps {
         IOMemoryDescriptor *buffer;
@@ -331,6 +379,7 @@ IOReturn NativeRamBlock::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 blo
         i+=n;
       }
     }
+#endif
     if(write)__atomic_fetch_add(&native_ram_block_writes,1,__ATOMIC_RELAXED);
     else __atomic_fetch_add(&native_ram_block_reads,1,__ATOMIC_RELAXED);
     native_ram_block_resident_bytes=isBig?big.resident:sparse.resident;
@@ -388,6 +437,17 @@ static int selectVolumeSeed(const char *uuid, dev_t *device, char *path, size_t 
   }
   bool ready = properties->setObject("UUID", wanted) && matching->setObject("IOPropertyMatch", properties);
   wanted->release(); properties->release();
+  // APFS publishes the RAM volume asynchronously. Wait once with a fixed bound,
+  // then enumerate again to enforce UUID uniqueness and NativeRamBlock ancestry.
+  if (ready) {
+    IOService *published = IOService::waitForMatchingService(matching, 5ULL * 1000000000ULL);
+    if (!published) {
+      IOLog("NativeRamBlock: Data UUID %.36s not published within 5s\n", uuid);
+      matching->release();
+      return 0;
+    }
+    published->release();
+  }
   OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
   matching->release();
   if (!iterator) return 0;
@@ -432,27 +492,6 @@ static int selectVolumeSeed(const char *uuid, dev_t *device, char *path, size_t 
 extern "C" int native_ram_block_volume_device(const char *uuid,dev_t *device,char *path,size_t size) {
   return selectVolumeSeed(uuid,device,path,size,nullptr,nullptr,nullptr);
 }
-// The GPU addon the loader placed after the trust caches (/chosen/memory-map/GpuAddon, scripts/make-gpu-addon.py), for the kernel's
-// boot-time addon install (kern_exec.c). Boot memory, like the seed: never freed here. Returns 0 without one.
-extern "C" int native_ram_block_gpu_addon(const uint8_t **data,uint64_t *bytes) {
-  if(!data || !bytes)return 0;
-  *data=nullptr;*bytes=0;
-  IORegistryEntry *map=IORegistryEntry::fromPath("/chosen/memory-map",gIODTPlane);
-  if(!map)return 0;
-  OSData *range=OSDynamicCast(OSData,map->getProperty("GpuAddon"));
-  uint64_t physical=0,size=0;
-  if(range && range->getLength()==16){
-    memcpy(&physical,range->getBytesNoCopy(),8);
-    memcpy(&size,static_cast<const uint8_t *>(range->getBytesNoCopy())+8,8);
-  }
-  map->release();
-  if(!size || size>(UINT64_C(64)<<20) || (physical&4095) || physical<gPhysBase || size>gPhysSize || physical-gPhysBase>gPhysSize-size)return 0;
-  *data=reinterpret_cast<const uint8_t *>(ml_static_ptovirt(physical));
-  if(!*data)return 0;
-  *bytes=size;
-  return 1;
-}
-
 extern "C" int native_ram_block_volume_seed(const char *uuid,dev_t *device,char *path,size_t size,
     uint64_t *base,uint64_t *bytes,uint8_t digest[32]) {
   if(!base || !bytes || !digest)return 0;

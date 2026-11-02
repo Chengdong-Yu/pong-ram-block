@@ -2,38 +2,38 @@
 
 ## Responsibility
 
-Maintain RAM-backed block device and sparse seed storage.
+Maintain NativeRamBlock, the Pong variant of the UniXNU `RamBlock` component: RAM 后端的 IOKit 块设备
 
 ## Required reading
 
-1. Read this repository's README and [component documentation](https://unixnu.com/drivers/ram-block).
-2. Read the [component catalog](https://unixnu.com/reference/components) and selected SoC and OS profiles in UniXNU.
+1. Read this repository's README and the [component catalog](https://unixnu.com/reference/components).
+2. Read the [UniXNU-pong](https://github.com/Chengdong-Yu/UniXNU-pong) device repository: `board.toml`, `dts/pong.dts`, and the matching `porting.toml` areas.
 3. Read the relevant implementation and its build entry point before editing.
-4. For ports, read the [porting overview](https://unixnu.com/porting/), [repository specification](https://unixnu.com/porting/device-repository), and [device-tree specification](https://unixnu.com/porting/device-tree).
-5. For kernel work, read XNU sources, the selected patch series, and [patch reference](https://unixnu.com/xnu/patch-reference).
-6. For image assembly, read [prelink](https://unixnu.com/concepts/prelink), [payload](https://unixnu.com/concepts/payload), and [UEFI firmware](https://unixnu.com/porting/uefi-firmware) pages on the UniXNU site.
-7. For migration, read the [migration guide](https://unixnu.com/porting/migration).
+4. For kernel work, read XNU sources, the selected patch series, and the [patch reference](https://unixnu.com/xnu/patch-reference).
+5. For image assembly, read the [packaging](https://unixnu.com/zh/porting/packaging) and [UEFI firmware](https://unixnu.com/porting/uefi-firmware) pages.
 
-## Component selection
+## Scope
 
-Search the catalog and existing implementations before adding a capability.
-Select dependencies by interface, hardware scope, OS ABI, and board inputs.
-Keep shared controller operations in their component or SoC repository.
-Keep device configuration in the device repository.
+This repository holds only this driver's sources. Board inputs live in the device repository:
+`configs/`, `dts/`, `board.toml`, and the build scripts under `scripts/`.
 
-Use `RamBlock` for the repository, catalog ID, checkout, and build references.
-Preserve source filenames, runtime classes, bundle names, exported symbols, and
-protocol identifiers recorded in the catalog.
+The device repository checks this tree out at `drivers/NativeRamBlock`. Sibling drivers are reached with
+relative includes such as `../PongPower/PongPlatformResources.h`, so directory names must not change.
+No firmware, restore images, private binaries, or credentials may be committed here.
 
 ## Build and verification
 
-Run `build-arm-driver.py RamBlock` from the resolved build tree after kernel preparation.
-Read [building](https://unixnu.com/building) and [bring-up](https://unixnu.com/porting/bring-up).
-Run applicable existing checks and report the commands, results, source
-revisions, and required inputs. Report hardware observations separately from
-build results, with the device and OS profile.
+Build from the device repository, which owns the toolchain and the kernel preparation:
+
+- `scripts/build-pong-format2.py --unixnu <checkout> --out <dir>`
+- or the narrower `scripts/build-*` entry point named in the README.
+
+Report the commands, results, and source revisions. Report hardware observations separately from
+build results, together with the device and OS profile. A successful link is not evidence that the
+hardware works.
 
 ## Documentation
 
-Maintain this README and the relevant English and Chinese pages in UniXNU.
-Use concise language describing current interfaces and behavior.
+Maintain this README. State the hardware the driver targets and the interfaces it publishes.
+Use concise language describing current behavior, and never claim a device result that a log does
+not show.
